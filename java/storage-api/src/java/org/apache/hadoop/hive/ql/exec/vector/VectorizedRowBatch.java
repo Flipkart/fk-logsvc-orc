@@ -38,6 +38,7 @@ public class VectorizedRowBatch implements Writable {
   public int[] selected;        // array of positions of selected values
   public int[] projectedColumns;
   public int projectionSize;
+  public boolean error;
 
   private int dataColumnCount;
   private int partitionColumnCount;

@@ -901,7 +901,11 @@ public class RecordReaderImpl implements RecordReader {
     stripeFooter = readStripeFooter(stripe);
     clearStreams();
     // setup the position in the stripe
-    rowCountInStripe = stripe.getNumberOfRows();
+    long max = 0;
+    for (StripeInformation si : stripes)
+      if (max < stripe.getNumberOfRows())
+        max = stripe.getNumberOfRows();
+    rowCountInStripe = max;
     rowInStripe = 0;
     rowBaseInStripe = 0;
     for (int i = 0; i < currentStripe; ++i) {
@@ -1081,6 +1085,7 @@ public class RecordReaderImpl implements RecordReader {
   @Override
   public boolean nextBatch(VectorizedRowBatch batch) throws IOException {
     try {
+      batch.error = false;
       if (rowInStripe >= rowCountInStripe) {
         currentStripe += 1;
         if (currentStripe >= stripes.size()) {
@@ -1094,7 +1099,14 @@ public class RecordReaderImpl implements RecordReader {
 
       rowInStripe += batchSize;
       reader.setVectorColumnCount(batch.getDataColumnCount());
-      reader.nextBatch(batch, batchSize);
+      try {
+        reader.nextBatch(batch, batchSize);
+      } catch (Exception e) {
+        batch.error = true;
+        advanceStripe();
+        return true;
+
+      }
       batch.selectedInUse = false;
       batch.size = batchSize;
       advanceToNextRow(reader, rowInStripe + rowBaseInStripe, true);

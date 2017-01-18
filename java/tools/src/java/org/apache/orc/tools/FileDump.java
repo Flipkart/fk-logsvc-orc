@@ -37,21 +37,14 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.PathFilter;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
+import org.apache.hadoop.hive.ql.exec.vector.VectorizedRowBatch;
+import org.apache.orc.*;
 import org.apache.orc.util.BloomFilter;
 import org.apache.orc.util.BloomFilterIO;
-import org.apache.orc.ColumnStatistics;
-import org.apache.orc.CompressionKind;
-import org.apache.orc.OrcFile;
-import org.apache.orc.Reader;
-import org.apache.orc.TypeDescription;
-import org.apache.orc.Writer;
 import org.apache.orc.impl.AcidStats;
 import org.apache.orc.impl.ColumnStatisticsImpl;
 import org.apache.orc.impl.OrcAcidUtils;
 import org.apache.orc.impl.OrcIndex;
-import org.apache.orc.OrcProto;
-import org.apache.orc.StripeInformation;
-import org.apache.orc.StripeStatistics;
 import org.apache.orc.impl.RecordReaderImpl;
 
 /**
@@ -416,40 +409,11 @@ public final class FileDump {
       System.err.println("Recovering file " + corruptFile);
       Path corruptPath = new Path(corruptFile);
       FileSystem fs = corruptPath.getFileSystem(conf);
-      FSDataInputStream fdis = fs.open(corruptPath);
       try {
         long corruptFileLen = fs.getFileStatus(corruptPath).getLen();
         long remaining = corruptFileLen;
-        List<Long> footerOffsets = new ArrayList<>();
 
-        // start reading the data file form top to bottom and record the valid footers
-        while (remaining > 0) {
-          int toRead = (int) Math.min(DEFAULT_BLOCK_SIZE, remaining);
-          byte[] data = new byte[toRead];
-          long startPos = corruptFileLen - remaining;
-          fdis.readFully(startPos, data, 0, toRead);
-
-          // find all MAGIC string and see if the file is readable from there
-          int index = 0;
-          long nextFooterOffset;
-
-          while (index != -1) {
-            index = indexOf(data, OrcFile.MAGIC.getBytes(), index + 1);
-            if (index != -1) {
-              nextFooterOffset = startPos + index + OrcFile.MAGIC.length() + 1;
-              if (isReadable(corruptPath, conf, nextFooterOffset)) {
-                footerOffsets.add(nextFooterOffset);
-              }
-            }
-          }
-
-          System.err.println("Scanning for valid footers - startPos: " + startPos +
-              " toRead: " + toRead + " remaining: " + remaining);
-          remaining = remaining - toRead;
-        }
-
-        System.err.println("Readable footerOffsets: " + footerOffsets);
-        recoverFile(corruptPath, fs, conf, footerOffsets, backup);
+        recoverFile(corruptPath, fs, conf, backup);
       } catch (Exception e) {
         Path recoveryFile = getRecoveryFile(corruptPath);
         if (fs.exists(recoveryFile)) {
@@ -459,8 +423,6 @@ public final class FileDump {
         e.printStackTrace();
         System.err.println(SEPARATOR);
         continue;
-      } finally {
-        fdis.close();
       }
       System.err.println(corruptFile + " recovered successfully!");
       System.err.println(SEPARATOR);
@@ -468,8 +430,9 @@ public final class FileDump {
   }
 
   private static void recoverFile(final Path corruptPath, final FileSystem fs,
-      final Configuration conf, final List<Long> footerOffsets, final String backup)
+      final Configuration conf, final String backup)
       throws IOException {
+    fs.setVerifyChecksum(false);
 
     // first recover the file to .recovered file and then once successful rename it to actual file
     Path recoveredPath = getRecoveryFile(corruptPath);
@@ -479,43 +442,50 @@ public final class FileDump {
       fs.delete(recoveredPath, false);
     }
 
-    // if there are no valid footers, the file should still be readable so create an empty orc file
-    if (footerOffsets == null || footerOffsets.isEmpty()) {
-      System.err.println("No readable footers found. Creating empty orc file.");
-      TypeDescription schema = TypeDescription.createStruct();
-      Writer writer = OrcFile.createWriter(recoveredPath,
-          OrcFile.writerOptions(conf).setSchema(schema));
-      writer.close();
-    } else {
-      FSDataInputStream fdis = fs.open(corruptPath);
-      FileStatus fileStatus = fs.getFileStatus(corruptPath);
-      // read corrupt file and copy it to recovered file until last valid footer
-      FSDataOutputStream fdos = fs.create(recoveredPath, true,
-          conf.getInt("io.file.buffer.size", 4096),
-          fileStatus.getReplication(),
-          fileStatus.getBlockSize());
-      try {
-        long fileLen = footerOffsets.get(footerOffsets.size() - 1);
-        long remaining = fileLen;
+    List<String> corruptedPaths = new ArrayList<String>();
+    corruptedPaths.add(corruptPath.toString());
 
-        while (remaining > 0) {
-          int toRead = (int) Math.min(DEFAULT_BLOCK_SIZE, remaining);
-          byte[] data = new byte[toRead];
-          long startPos = fileLen - remaining;
-          fdis.readFully(startPos, data, 0, toRead);
-          fdos.write(data);
-          System.err.println("Copying data to recovery file - startPos: " + startPos +
-              " toRead: " + toRead + " remaining: " + remaining);
-          remaining = remaining - toRead;
-        }
-      } catch (Exception e) {
-        fs.delete(recoveredPath, false);
-        throw new IOException(e);
-      } finally {
-        fdis.close();
-        fdos.close();
+    List<String> recoveryPath = new ArrayList<String>();
+    recoveryPath.add(recoveredPath.toString());
+
+    long skippedStripes = 0;
+
+    Reader reader = FileDump.getReader(corruptPath, conf, corruptedPaths);
+    FileStatus fileStatus = fs.getFileStatus(corruptPath);
+    conf.set("orc.stripe.size", "67108864");
+    conf.set("orc.row.index.stride", "50000");
+
+    Writer writer = OrcFile.createWriter(recoveredPath,
+            OrcFile.writerOptions(conf).setSchema(reader.getSchema()));
+
+    VectorizedRowBatch batch = reader.getSchema().createRowBatch();
+
+    try {
+
+      if (reader == null) {
+        return;
       }
+      RecordReader rows = reader.rows();
+      while (rows.nextBatch(batch)) {
+        if (!batch.error) {
+          writer.addRowBatch(batch);
+        } else {
+          skippedStripes++;
+        }
+      }
+    } catch (Exception e) {
+      fs.delete(recoveredPath, false);
+      throw new IOException(e);
     }
+    writer.close();
+    fs.setReplication(recoveredPath, fileStatus.getReplication());
+    System.out.printf("corrupted file size: %d, recovered path size: %d\n", fileStatus.getLen(), fs.getFileStatus(recoveredPath).getLen());
+    System.out.printf("corrupted file rows: %d, recovered path rows: %d\n", reader.getNumberOfRows(), FileDump.getReader(recoveredPath, conf, recoveryPath).getNumberOfRows());
+    System.out.printf("corrupted file stripes: %d, recovered path stripes: %d\n", reader.getStripes().size(), reader.getStripes().size() - skippedStripes);
+
+    System.out.printf("stats,%s,size,%d, %d\n", fileStatus.getPath().toString(), fileStatus.getLen(), fs.getFileStatus(recoveredPath).getLen());
+    System.out.printf("stats,%s,rows,%d, %d\n",fileStatus.getPath().toString(), reader.getNumberOfRows(), FileDump.getReader(recoveredPath, conf, recoveryPath).getNumberOfRows());
+    System.out.printf("stats,%s,stripes,%d, %d\n", fileStatus.getPath().toString(), reader.getStripes().size(), reader.getStripes().size() - skippedStripes);
 
     // validate the recovered file once again and start moving corrupt files to backup folder
     if (isReadable(recoveredPath, conf, Long.MAX_VALUE)) {
@@ -534,16 +504,14 @@ public final class FileDump {
       // Move data file to backup path
       moveFiles(fs, corruptPath, backupDataPath);
 
-      // Move side file to backup path
-      Path sideFilePath = OrcAcidUtils.getSideFile(corruptPath);
-      Path backupSideFilePath = new Path(backupDataPath.getParent(), sideFilePath.getName());
-      moveFiles(fs, sideFilePath, backupSideFilePath);
+
 
       // finally move recovered file to actual file
       moveFiles(fs, recoveredPath, corruptPath);
 
       // we are done recovering, backing up and validating
       System.err.println("Validation of recovered file successful!");
+
     }
   }
 
